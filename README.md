@@ -1,4 +1,5 @@
 修复了原版卡死的问题，同时针对于macos进行了优化
+
 [English](README_EN.md) | 简体中文
 
 # IDA NO MCP
@@ -41,17 +42,6 @@ ln -s /path/to/IDA-NO-MCP/oldpython/INP.py ~/.idapro/plugins/INP.py
 
 **Rust 二进制**（命令行用）—— 见下方「构建」章节。
 
-### 正确性验证（Rust == Python）
-
-三个独立文件的对照测试，Rust 与 Python **100% 一致**（函数集合零差异 + 伪代码逐字节相同）：
-
-| 测试文件 | IDA 函数 | Rust 导出 | Python 导出 | 匹配 |
-|----------|---------|-----------|-------------|------|
-| okrd_server_linux（9.6MB Go） | 7,794 | 5,980 | 5,980 | 100% |
-| okrd_control_linux（9.4MB Go） | 7,642 | 5,874 | 5,874 | 100% |
-| ok_edr_server/main（8.8MB packed） | 29 | 29 | 29 | 100% |
-
-### Rust 版实测性能
 
 ### Rust 版实测性能
 
@@ -62,23 +52,6 @@ ln -s /path/to/IDA-NO-MCP/oldpython/INP.py ~/.idapro/plugins/INP.py
 | 吞吐 | 112 函数/秒 | **133–159 函数/秒** | **+19%** |
 | 峰值 RSS | 1,289 MB | **1,460 MB** | 持平 |
 
-**draw.io Electron Framework（177MB，stripped C++/V8）：**
-
-| 模式 | 结果 | 时间 |
-| ---- | ---- | ---- |
-| 原版 Python | 14+ 分钟卡死（连 IDA 自动分析都跑不完） | 失败 |
-| **Rust `--skip-analysis`** | **导出 1,499 函数（= IDA 能发现的全部）+ 9103 exports + 3937 imports** | **22 秒** |
-
-> 注：draw.io 这种 177MB 的 Electron/V8 二进制，IDA 自动分析本身也只能识别出 1,499 个函数（入口点 + 启发式），不是工具漏掉了函数。Rust 版用 `--skip-analysis` 绕过 14 分钟的无效分析等待，22 秒拿到全部可用结果。
-
-**正确性验证（okrd_server_linux，9.6MB stripped Go 二进制）：**
-
-| 指标 | Python 版 | **Rust 版** |
-| ---- | --------- | ----------- |
-| IDA 发现函数数 | 7,794 | 7,794 |
-| 导出函数数（去 lib/thunk） | 5,980 | **5,980（100% 匹配）** |
-| 函数地址集合差集 | — | **0（完全一致）** |
-| 单函数伪代码内容 | `internal_cpu.doinit` | **逐字节相同** |
 
 ## 使用（Rust 版）
 
@@ -102,7 +75,6 @@ cargo build --release
 
 **本地开发**（用 checkout 出来的 idalib 源码而非 crates.io 版本）：参考 `Cargo.toml.dev.example`。
 
-**多平台 CI**：`.github/workflows/release.yml` 在 macOS（arm64+x86_64）/Linux/Windows 各跑一个 release 构建，上传产物为 artifact。注意：CI runner 上没有 IDA license，所以 CI 只验证「能编译通过」；要产出可运行的二进制，需在装了 IDA 的机器上构建（或把 IDA license 注入 CI secret 后扩展 workflow）。
 
 ### 产物
 
@@ -280,10 +252,9 @@ idat -A -S"INP.py /tmp/out 0 consolidated" huge_framework.i64
 ### 内存与性能（大文件）
 
 - **修复 Mac 内存爆炸**：移除 `function_index` / `addr_to_info` 的全量内存累积（原版在 270 万函数时 RAM 用到 140G 的根因），`function_index.txt` / `function_list.txt` 改为流式 append 写，常数内存。
-- **消除 O(F·degree) 索引开销**：原版写索引时对每个 caller/callee 反向解析名字，既吃内存又吃 CPU；现在只保留地址列表。
+- **消除 O(F·degree) 索引开销**：原版写索引时对每个 caller/callee 反向解析名字，既吃内存又吃 CPU；现在只保留地址列表。部分情况下存在bug🥹🥹🥹🥹
 - **consolidated 模式**：大文件（默认 > 20000 函数）自动切到单文件 `decompiled.c` + 采样 `callgraph.txt`，跳过昂贵的全量图遍历和 raw memory 导出。
 - **批处理 tick**：consolidated 模式每个 timer tick 处理多个函数（受时间预算约束），提升吞吐，同时保持 UI/Cancel 响应。
-- 详见 [NATIVE.md](NATIVE.md) 对「原生重写」请求的技术分析（结论：Hex-Rays 反编译器本身已是 C++，Python 层是编排，原生重写收益有限；真正可下沉的纯计算热路径在 NATIVE.md 中给出）。
 
 ### 路径健壮性
 
