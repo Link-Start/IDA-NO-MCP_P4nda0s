@@ -1,8 +1,7 @@
 # macOS
 .DS_Store
 
-# Agent / tool artifacts
-.zcode/
+
 Cargo.lock
 # Rust build output (very large; never commit)
 /target/
