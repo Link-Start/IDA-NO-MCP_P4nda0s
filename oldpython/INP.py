@@ -36,6 +36,27 @@ MAX_FUNC_SIZE_FOR_DECOMPILE = 16 * 1024   # 超过此字节数的函数跳过反
 MAX_FUNC_INSN_COUNT = 3000               # 超过此指令数的函数跳过反编译（对 Go 二进制更精准，降低阈值防止反编译器卡死）
 DECOMPILE_TIME_LIMIT = 15                # 单个函数反编译超时（秒），超时自动加入黑名单
 
+# 导出模式（避免内存爆炸 + token 爆炸）
+#   auto         : 自动判断，函数数 > LARGE_BINARY_FUNC_THRESHOLD 时切到 consolidated
+#   legacy       : 强制传统模式（每函数一个 .c/.asm），小文件推荐，向后兼容
+#   consolidated : 强制合并模式（单文件 decompiled.c + function_list.txt），大文件推荐
+EXPORT_MODE_AUTO = "auto"
+EXPORT_MODE_LEGACY = "legacy"
+EXPORT_MODE_CONSOLIDATED = "consolidated"
+EXPORT_MODES = (EXPORT_MODE_AUTO, EXPORT_MODE_LEGACY, EXPORT_MODE_CONSOLIDATED)
+EXPORT_MODE_DEFAULT = EXPORT_MODE_AUTO
+
+LARGE_BINARY_FUNC_THRESHOLD = 20000  # 函数数超过此值视为大文件，auto 模式下自动切到 consolidated
+LARGE_CALLGRAPH_BFS_HOPS = 3         # consolidated 模式下，从 entry/export 起做的 BFS 跳数
+LARGE_CALLGRAPH_MAX_NODES = 5000     # consolidated 模式下，callgraph.txt 最多保留的节点数
+LARGE_STRING_MIN_LEN = 4             # consolidated 模式下，strings.txt 最小字符串长度（过滤噪声、省 token）
+LARGE_BATCH_PER_TICK = 8             # 每个 timer tick 处理的函数数（大文件批处理，提升吞吐）
+# Hex-Rays cfunc_t 缓存清理间隔（函数数）
+#   legacy       : 500（小文件，缓存压力小）
+#   consolidated : 100（大文件，Hex-Rays 反编译缓存 ~130KB/func，不勤清会持续涨）
+DECOMPILE_CACHE_CLEAR_LEGACY = 500
+DECOMPILE_CACHE_CLEAR_CONSOLIDATED = 100
+
 # 从模块中读取反编译标志常量（带硬编码回退，兼容各版本 IDA）
 # DECOMP_NO_WAIT(0x1): 禁止反编译器显示内部等待框（macOS 上该对话框会触发嵌套事件循环导致卡死）
 # DECOMP_NO_CACHE(0x4): 不使用反编译缓存（支持 patch 后重新导出正确伪代码）
@@ -50,34 +71,112 @@ def get_worker_count():
     return WORKER_COUNT
 
 
-def get_idb_directory():
-    """获取 IDB 文件所在目录"""
+def _get_idb_path():
+    """获取 IDB 文件路径，依次尝试 input_file_path / ida_loader。"""
     idb_path = ida_nalt.get_input_file_path()
     if not idb_path:
-        import ida_loader
-        idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
-    return os.path.dirname(idb_path) if idb_path else os.getcwd()
+        try:
+            import ida_loader
+            idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+        except Exception:
+            idb_path = None
+    return idb_path
+
+
+def _is_writable_dir(path):
+    """判断目录是否真实可写。
+
+    解决原版 [WinError 3] 'G:\\' 之类的问题：原始二进制所在盘符可能已被卸载
+    或网络路径不可达，此时 os.path.exists / os.makedirs 会直接抛错。
+    """
+    if not path:
+        return False
+    try:
+        if not os.path.isdir(path):
+            return False
+        return os.access(path, os.W_OK)
+    except Exception:
+        return False
+
+
+def _ensure_writable_dir(path):
+    """对候选目录做存在/可写校验：已存在且可写则原样返回，否则返回 None。
+
+    不在这里抛异常，由调用方决定回退策略（例如回退到 cwd）。
+    """
+    if path and _is_writable_dir(path):
+        return path
+    return None
+
+
+def _pick_writable_base_dir(candidates):
+    """按优先级从候选目录列表中挑第一个可写的。全失败时回退到 cwd。"""
+    for cand in candidates:
+        resolved = _ensure_writable_dir(cand)
+        if resolved:
+            return resolved
+    return os.getcwd()
+
+
+def get_idb_directory():
+    """获取 IDB 文件所在目录（已校验可写，失败回退 cwd）。"""
+    idb_path = _get_idb_path()
+    input_dir = os.path.dirname(idb_path) if idb_path else None
+    return _pick_writable_base_dir([input_dir])
 
 
 def get_default_export_dir():
-    """默认导出目录：`原文件名.扩展名_export_for_ai`。"""
-    input_path = ida_nalt.get_input_file_path()
-    if not input_path:
-        try:
-            import ida_loader
-            input_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
-        except Exception:
-            input_path = None
+    """默认导出目录：`原文件名_export_for_ai`，放在原始二进制所在目录。
 
-    base_dir = os.path.dirname(input_path) if input_path else os.getcwd()
-    file_name = os.path.basename(input_path) if input_path else "input.bin"
+    若原始二进制所在目录不可写（如原版报 [WinError 3] 'G:\\'，盘符已卸载/网络路径失效），
+    则按优先级回退：input_dir → idb_dir → cwd，确保始终落在可写位置。
+    """
+    idb_path = _get_idb_path()
+
+    if idb_path:
+        input_dir = os.path.dirname(idb_path)
+        file_name = os.path.basename(idb_path)
+    else:
+        input_dir = None
+        file_name = "input.bin"
+
+    # 优先用原始二进制目录；不可写（已卸载盘符/网络路径失效）则回退到 cwd
+    base_dir = _pick_writable_base_dir([input_dir])
     return os.path.join(base_dir, "{}_export_for_ai".format(file_name))
 
 
 def ensure_dir(path):
-    """确保目录存在"""
-    if not os.path.exists(path):
-        os.makedirs(path)
+    """确保目录存在且可写。
+
+    相比原版的两行实现：
+    - 用 exist_ok=True 避免 TOCTOU 竞态；
+    - 创建后做可写校验，对已卸载盘符（'G:\\' 之类）直接给出清晰错误而非底层 WinError。
+    """
+    if not path:
+        raise ValueError("ensure_dir: path is empty")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        # 目录本身不可达（如盘符已卸载），抛出带上下文的清晰错误
+        raise OSError("Cannot create export directory '{}': {}. "
+                      "If the original binary's drive is unmounted (e.g. 'G:\\'), "
+                      "move the IDB to a writable local path.".format(path, e))
+    if not _is_writable_dir(path):
+        raise OSError("Export directory exists but is not writable: '{}'".format(path))
+    return path
+
+
+def _resolve_export_mode(mode, func_count):
+    """将用户指定的模式解析为最终生效模式。
+
+    auto: 函数数 > LARGE_BINARY_FUNC_THRESHOLD → consolidated，否则 legacy
+    legacy / consolidated: 原样返回
+    """
+    if mode not in EXPORT_MODES:
+        mode = EXPORT_MODE_DEFAULT
+    if mode == EXPORT_MODE_AUTO:
+        return EXPORT_MODE_CONSOLIDATED if func_count > LARGE_BINARY_FUNC_THRESHOLD else EXPORT_MODE_LEGACY
+    return mode
 
 
 def clear_undo_buffer():
@@ -393,13 +492,16 @@ class _FuncExportJob(object):
 
     TIMER_INTERVAL_MS = 5      # tick 间隔（ms）；5ms 在函数间快速切换，macOS 事件循环仍正常响应
 
-    def __init__(self, export_dir, skip_existing=True, force_reexport=False):
+    def __init__(self, export_dir, skip_existing=True, force_reexport=False, export_mode=None):
         # 延迟初始化：构造函数不调用任何 IDA API，也不创建线程池
         # ThreadPoolExecutor 延迟到 _lazy_init() 中创建，避免在 pipeline timer
         # 回调中创建线程导致 macOS Cocoa NSRunLoop 死锁
         self.export_dir = export_dir
         self.skip_existing = skip_existing
         self.force_reexport = force_reexport
+        # export_mode 由 _lazy_init 根据 func 数量最终定稿（auto → legacy/consolidated）
+        self.export_mode = export_mode or EXPORT_MODE_AUTO
+        self._resolved_mode = None
 
         self.remaining_funcs = []  # 在 _lazy_init 中填充
         self.total_funcs = 0
@@ -411,8 +513,9 @@ class _FuncExportJob(object):
         self.fallback_funcs = []
         self.failed_funcs = []
         self.skipped_funcs = []
-        self.function_index = []
-        self.addr_to_info = {}
+        # NOTE: 不再保留 function_index(list) 与 addr_to_info(dict) 的全量内存累积。
+        #       原版这两个容器会随函数数线性增长，270万函数时直接吃光 RAM（Mac 140G 爆炸）。
+        #       function_index.txt 改为流式写（_index_f），caller/callee 反向名字解析被移除。
 
         # ThreadPoolExecutor 延迟到 _lazy_init() 中创建
         self.io_executor = None
@@ -432,6 +535,13 @@ class _FuncExportJob(object):
         self._last_func_status = None
         self._last_error_msg = None
         self._recent_errors = 0
+
+        # 流式索引文件句柄（legacy 模式 = function_index.txt，consolidated = function_list.txt）
+        self._index_f = None
+        # consolidated 模式：合并输出 decompiled.c 的追加写句柄
+        self._decompiled_f = None
+        # consolidated 模式是否跳过 caller/callee 图遍历（大文件主要 CPU 杀手之一）
+        self._skip_callgraph_walks = False
 
         self._initialized = False  # 延迟初始化标志
         self._start_time = 0       # pipeline 起始时间，由 _tick_decompile 设置
@@ -542,8 +652,19 @@ class _FuncExportJob(object):
         将这些 IDA API 调用延迟到 timer tick 中，避免在 __init__ 或 pipeline tick
         中阻塞。此时 pipeline 已完全结束，不会有定时器冲突。
         """
-        ensure_dir(os.path.join(self.export_dir, "decompile"))
-        ensure_dir(os.path.join(self.export_dir, "disassembly"))
+        # 根据函数总数最终定稿导出模式（auto → legacy/consolidated）
+        all_funcs = list(idautils.Functions())
+        self.total_funcs = len(all_funcs)
+        self._resolved_mode = _resolve_export_mode(self.export_mode, self.total_funcs)
+        self._skip_callgraph_walks = (self._resolved_mode == EXPORT_MODE_CONSOLIDATED)
+        logger.info("Export mode: %s (resolved=%s, funcs=%d, skip_callgraph_walks=%s)",
+                    self.export_mode, self._resolved_mode, self.total_funcs,
+                    self._skip_callgraph_walks)
+
+        # legacy 模式需要 decompile/disassembly 子目录；consolidated 模式只写单文件
+        if self._resolved_mode == EXPORT_MODE_LEGACY:
+            ensure_dir(os.path.join(self.export_dir, "decompile"))
+            ensure_dir(os.path.join(self.export_dir, "disassembly"))
 
         if self.force_reexport:
             processed_addrs, prev_fallback, prev_failed, prev_skipped = set(), [], [], []
@@ -553,9 +674,6 @@ class _FuncExportJob(object):
 
         self.crash_blacklist = load_crash_blacklist(self.export_dir)
 
-        all_funcs = list(idautils.Functions())
-
-        self.total_funcs = len(all_funcs)
         self.remaining_funcs = [ea for ea in all_funcs if ea not in processed_addrs]
         self.processed_addrs = processed_addrs
         self.fallback_funcs = list(prev_fallback)
@@ -571,6 +689,18 @@ class _FuncExportJob(object):
 
         self._job_start_time = time.time()
 
+        # 打开流式索引文件句柄（常数内存，每函数 append 一行，不再攒全量）
+        #   legacy       → function_index.txt（含 caller/callee 地址列表）
+        #   consolidated → function_list.txt（精简，单行）
+        self._open_index_file()
+
+        # consolidated 模式：打开 decompiled.c 追加写句柄
+        if self._resolved_mode == EXPORT_MODE_CONSOLIDATED:
+            decomp_path = os.path.join(self.export_dir, "decompiled.c")
+            # force_reexport 时截断重写，否则追加（支持断点续跑）
+            mode = 'wb' if self.force_reexport else 'ab'
+            self._decompiled_f = open(decomp_path, mode, buffering=1 << 20)
+
         # 测试反编译是否可用：尝试反编译第一个函数
         test_ea = self.remaining_funcs[0]
         try:
@@ -581,17 +711,86 @@ class _FuncExportJob(object):
 
         # 在 lazy init 中创建线程池（而非 __init__），避免在 pipeline timer 回调中
         # 创建线程导致 macOS Cocoa NSRunLoop 死锁
-        if self.io_executor is None:
+        #   consolidated 模式：主线程直写单文件，I/O 线程池仅用于 legacy 的每函数文件
+        if self.io_executor is None and self._resolved_mode == EXPORT_MODE_LEGACY:
             io_workers = max(2, int((os.cpu_count() or 2) * 0.7))
             self.io_executor = ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="INP-IO")
 
         return True
 
-    def tick(self):
-        """每次由 IDA 定时器调用，处理一个函数。返回下次间隔（ms）或 -1 停止。
+    # ------------------------------------------------------------------
+    # 流式索引文件管理（常数内存，替代原版的全量 function_index 列表）
+    # ------------------------------------------------------------------
 
-        每次 tick 只处理一个函数，确保在两次 tick 之间 IDA 事件循环有机会处理
-        UI 事件（包括 Cancel 按钮点击）。即使单个 decompile() 调用耗时较长，
+    def _index_filename(self):
+        return "function_list.txt" if self._resolved_mode == EXPORT_MODE_CONSOLIDATED else "function_index.txt"
+
+    def _open_index_file(self):
+        """打开流式索引文件句柄。
+
+        legacy: function_index.txt — 每函数含 callers/callees 地址列表（不再反向解析名字）
+        consolidated: function_list.txt — 每函数单行精简
+        断点续跑时追加（不截断已有内容）。
+        """
+        path = os.path.join(self.export_dir, self._index_filename())
+        # force_reexport 时截断；否则追加续写
+        mode = 'wb' if self.force_reexport else 'ab'
+        self._index_f = open(path, mode, buffering=1 << 20)
+        if self.force_reexport:
+            header = "# Function Index (streamed, no in-memory accumulation)\n"
+            if self._resolved_mode == EXPORT_MODE_CONSOLIDATED:
+                header += "# Format: address | name | export_type | fallback_reason\n"
+            else:
+                header += "# Format: address | name | export_type | file | callers | callees | fallback_reason\n"
+            header += "#" + "=" * 80 + "\n\n"
+            self._index_f.write(header.encode('utf-8'))
+
+    def _append_index_line(self, func_ea, func_name, export_type, output_filename, callers, callees, fallback_reason):
+        """向流式索引文件 append 一行（不在内存里保留任何全量结构）。"""
+        if self._index_f is None:
+            return
+        if self._resolved_mode == EXPORT_MODE_CONSOLIDATED:
+            line = "{:X} | {} | {} | {}\n".format(
+                func_ea, func_name, export_type, fallback_reason or "")
+        else:
+            callers_str = ",".join(hex(c) for c in callers) if callers else ""
+            callees_str = ",".join(hex(c) for c in callees) if callees else ""
+            line = "{:X} | {} | {} | {} | {} | {} | {}\n".format(
+                func_ea, func_name, export_type, output_filename or "",
+                callers_str, callees_str, fallback_reason or "")
+        try:
+            self._index_f.write(line.encode('utf-8'))
+        except Exception:
+            pass
+
+    def _close_stream_files(self):
+        """关闭所有流式文件句柄（索引 + 合并输出）。"""
+        for attr in ("_index_f", "_decompiled_f"):
+            f = getattr(self, attr, None)
+            if f is not None and not f.closed:
+                try:
+                    f.flush()
+                    f.close()
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+
+    def _flush_decompiled_stream(self):
+        """刷新所有流式文件（decompiled.c + 索引文件），防止被强制终止时丢数据。"""
+        for attr in ("_decompiled_f", "_index_f"):
+            f = getattr(self, attr, None)
+            if f is not None and not f.closed:
+                try:
+                    f.flush()
+                except Exception:
+                    pass
+
+    def tick(self):
+        """每次由 IDA 定时器调用，处理若干函数。返回下次间隔（ms）或 -1 停止。
+
+        单个 tick 处理多个函数（consolidated 模式批处理 LARGE_BATCH_PER_TICK 个，
+        legacy 模式仍 1 个以保留细粒度 wait box），但每批之间会检查 user_cancelled，
+        确保 UI/Cancel 始终响应。即使单个 decompile() 调用耗时较长，
         下一次 tick 开始时用户仍可通过 Cancel 中止。
         """
         self._tick_count += 1
@@ -612,7 +811,7 @@ class _FuncExportJob(object):
                 return -1
             self._initialized = True
 
-        # 收集已完成的写入（非阻塞）
+        # 收集已完成的写入（非阻塞，仅 legacy 模式有 pending futures）
         self._collect_done_futures()
 
         # 检查用户取消
@@ -627,39 +826,55 @@ class _FuncExportJob(object):
             self._finish(cancelled=False)
             return -1
 
-        func_ea = self.remaining_funcs[self.idx]
-        self.idx += 1
+        # 批处理大小：consolidated 模式一次处理多个函数以提升吞吐；legacy 保持 1 个
+        batch_size = LARGE_BATCH_PER_TICK if self._resolved_mode == EXPORT_MODE_CONSOLIDATED else 1
+        batch_processed = 0
 
-        # 记录当前函数的计时信息
-        self._current_func_ea = func_ea
-        self._current_func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
-        self._current_func_start_time = time.time()
+        while batch_processed < batch_size and self.idx < len(self.remaining_funcs):
+            # 批处理中途再次检查取消，保持响应
+            if batch_processed > 0 and self._wait_box_active and ida_kernwin.user_cancelled():
+                self._finish(cancelled=True)
+                return -1
 
+            func_ea = self.remaining_funcs[self.idx]
+            self.idx += 1
 
-        # 先更新等待框（让用户看到即将处理哪个函数，便于判断卡死位置）
-        self._update_wait_box()
+            # 记录当前函数的计时信息
+            self._current_func_ea = func_ea
+            self._current_func_name = ida_funcs.get_func_name(func_ea) or hex(func_ea)
+            self._current_func_start_time = time.time()
 
-        self._process_one(func_ea)
+            # 仅在批次开头更新一次等待框（每函数更新在大文件下反而拖慢）
+            if batch_processed == 0:
+                self._update_wait_box()
 
-        # 记录完成时间
-        func_elapsed = time.time() - self._current_func_start_time
-        self._last_func_name = self._current_func_name
-        self._last_func_time = func_elapsed
-        self._current_func_name = None
-        self._current_func_ea = None
+            self._process_one(func_ea)
 
-        # 更新等待框显示完成结果
+            # 记录完成时间
+            func_elapsed = time.time() - self._current_func_start_time
+            self._last_func_name = self._current_func_name
+            self._last_func_time = func_elapsed
+            self._current_func_name = None
+            self._current_func_ea = None
+
+            batch_processed += 1
+
+        # 批次结束更新一次等待框显示最新结果
         self._update_wait_box()
 
         # 每 50 个函数保存一次进度
         if self.idx % 50 == 0:
             self._flush_all_pending(wait=False)
+            self._flush_decompiled_stream()
             save_progress(self.export_dir, self.processed_addrs,
                           self.fallback_funcs, self.failed_funcs, self.skipped_funcs)
             logger.info("Progress: %d/%d functions", self.idx, len(self.remaining_funcs))
 
-        # 每 500 个函数清理一次内存
-        if self.idx % 500 == 0:
+        # 清理 Hex-Rays cfunc_t 缓存（大文件更勤，~130KB/func 不清会持续涨）
+        clear_interval = (DECOMPILE_CACHE_CLEAR_CONSOLIDATED
+                          if self._resolved_mode == EXPORT_MODE_CONSOLIDATED
+                          else DECOMPILE_CACHE_CLEAR_LEGACY)
+        if self.idx % clear_interval == 0:
             clear_undo_buffer()
             try:
                 if ida_hexrays:
@@ -706,11 +921,15 @@ class _FuncExportJob(object):
 
                 if self.idx % 50 == 0:
                     self._flush_all_pending(wait=False)
+                    self._flush_decompiled_stream()
                     save_progress(self.export_dir, self.processed_addrs,
                                   self.fallback_funcs, self.failed_funcs, self.skipped_funcs)
                     logger.info("Progress: %d/%d functions", self.idx, len(self.remaining_funcs))
 
-                if self.idx % 500 == 0:
+                clear_interval = (DECOMPILE_CACHE_CLEAR_CONSOLIDATED
+                                  if self._resolved_mode == EXPORT_MODE_CONSOLIDATED
+                                  else DECOMPILE_CACHE_CLEAR_LEGACY)
+                if self.idx % clear_interval == 0:
                     clear_undo_buffer()
                     try:
                         if ida_hexrays:
@@ -727,6 +946,7 @@ class _FuncExportJob(object):
                     self.io_executor.shutdown(wait=True)
             except Exception:
                 pass
+            self._close_stream_files()
             clear_processing(self.export_dir)
             save_progress(self.export_dir, self.processed_addrs,
                           self.fallback_funcs, self.failed_funcs, self.skipped_funcs)
@@ -754,8 +974,8 @@ class _FuncExportJob(object):
             self._last_func_status = "skipped"
             return
 
-        # 检查是否已存在（跳过模式）
-        if self.skip_existing and not self.force_reexport:
+        # 检查是否已存在（跳过模式，仅 legacy 模式有每函数文件可检查）
+        if self._resolved_mode == EXPORT_MODE_LEGACY and self.skip_existing and not self.force_reexport:
             existing, _ = find_existing_function_output(self.export_dir, func_ea)
             if existing:
                 self.exported_funcs += 1
@@ -828,27 +1048,40 @@ class _FuncExportJob(object):
                 return
             export_type = "disassembly-fallback"
 
-        callers = get_callers(func_ea)
-        callees = get_callees(func_ea)
+        # caller/callee 图遍历：
+        #   legacy       — 保留，写入每函数文件头 + 流式索引
+        #   consolidated — 跳过（大文件主要 CPU 杀手之一），图关系改由 callgraph.txt 提供
+        callers = [] if self._skip_callgraph_walks else get_callers(func_ea)
+        callees = [] if self._skip_callgraph_walks else get_callees(func_ea)
 
-        # 提交文件写入到 I/O 线程池（纯文件 I/O，不调用 IDA API）
-        job_args = (func_ea, func_name, output_body, callers, callees, export_type, fallback_reason)
-        export_dir = self.export_dir
+        if self._resolved_mode == EXPORT_MODE_CONSOLIDATED:
+            # 合并模式：主线程直接 append 到 decompiled.c（常数内存，无线程池、无每函数文件）
+            self._write_consolidated(func_ea, func_name, output_body, export_type,
+                                     callers, callees, fallback_reason)
+        else:
+            # legacy 模式：提交每函数文件写入到 I/O 线程池（纯文件 I/O，不调用 IDA API）
+            job_args = (func_ea, func_name, output_body, callers, callees, export_type, fallback_reason)
+            export_dir = self.export_dir
 
-        def _write(args):
-            ea, name, body, calrs, callrs, etype, freason = args
-            lines = build_function_output_lines(ea, name, etype, calrs, callrs, body,
-                                                fallback_reason=freason)
-            path = get_function_output_path(export_dir, ea, etype)
-            try:
-                with open(path, 'w', encoding='utf-8') as f:
-                    f.write('\n'.join(lines))
-                return True, get_function_output_relative_path(ea, etype), calrs, callrs, etype, freason, None
-            except IOError as e:
-                return False, get_function_output_relative_path(ea, etype), calrs, callrs, etype, freason, str(e)
+            def _write(args):
+                ea, name, body, calrs, callrs, etype, freason = args
+                lines = build_function_output_lines(ea, name, etype, calrs, callrs, body,
+                                                    fallback_reason=freason)
+                path = get_function_output_path(export_dir, ea, etype)
+                try:
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write('\n'.join(lines))
+                    return True, get_function_output_relative_path(ea, etype), calrs, callrs, etype, freason, None
+                except IOError as e:
+                    return False, get_function_output_relative_path(ea, etype), calrs, callrs, etype, freason, str(e)
 
-        future = self.io_executor.submit(_write, job_args)
-        self.pending_futures.append((future, func_ea, func_name, callers, callees, export_type, fallback_reason))
+            if self.io_executor is None:
+                # 理论上 _lazy_init 已创建；防御性兜底
+                io_workers = max(2, int((os.cpu_count() or 2) * 0.7))
+                self.io_executor = ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="INP-IO")
+            future = self.io_executor.submit(_write, job_args)
+            # 仅保留 future 与最少必要字段（不再全量保留 callers/callees 列表引用）
+            self.pending_futures.append((future, func_ea, func_name, export_type, fallback_reason))
 
         # 更新上一个函数的状态
         if export_type == "disassembly-fallback":
@@ -858,35 +1091,66 @@ class _FuncExportJob(object):
             self._last_func_status = "ok"
             self._last_error_msg = None
 
+    def _write_consolidated(self, func_ea, func_name, body, export_type,
+                            callers, callees, fallback_reason):
+        """合并模式：把一个函数（含元数据头）追加写入 decompiled.c，并同步写一行索引。
+
+        全程主线程同步写，无 pending futures、无全量内存结构。
+        """
+        header_lines = build_function_output_lines(
+            func_ea, func_name, export_type, callers, callees, "",
+            fallback_reason=fallback_reason)
+        # 用文本模式拼接后整体写入（append）
+        chunk = ('\n'.join(header_lines[:8]) + '\n' + body + '\n\n').encode('utf-8', errors='replace')
+        try:
+            if self._decompiled_f is not None and not self._decompiled_f.closed:
+                self._decompiled_f.write(chunk)
+        except Exception as e:
+            self.failed_funcs.append((func_ea, func_name, "IO error: {}".format(str(e))))
+            self.processed_addrs.add(func_ea)
+            return
+        self.exported_funcs += 1
+        self.processed_addrs.add(func_ea)
+        if export_type == "disassembly-fallback":
+            self.fallback_funcs.append((func_ea, func_name,
+                                        fallback_reason or "decompilation failed", "decompiled.c"))
+        # 流式写索引（function_list.txt）
+        self._append_index_line(func_ea, func_name, export_type, "decompiled.c",
+                                callers, callees, fallback_reason)
+
     # ------------------------------------------------------------------
     # I/O 结果收集
     # ------------------------------------------------------------------
 
     def _collect_done_futures(self):
-        """收集已完成的写入 future（非阻塞）。"""
+        """收集已完成的写入 future（非阻塞）。仅 legacy 模式有 pending futures。"""
+        if not self.pending_futures:
+            return
         still_pending = []
         for item in self.pending_futures:
-            future, func_ea, func_name, callers, callees, export_type, fallback_reason = item
+            future, func_ea, func_name, export_type, fallback_reason = item
             if not future.done():
                 still_pending.append(item)
                 continue
-            self._record_future_result(future, func_ea, func_name, callers, callees, export_type, fallback_reason)
+            self._record_future_result(future, func_ea, func_name, export_type, fallback_reason)
         self.pending_futures = still_pending
 
     def _flush_all_pending(self, wait=True):
         """等待所有挂起 future 完成并收集结果。"""
+        if not self.pending_futures:
+            return
         for item in self.pending_futures:
-            future, func_ea, func_name, callers, callees, export_type, fallback_reason = item
+            future, func_ea, func_name, export_type, fallback_reason = item
             try:
                 if wait:
                     future.result(timeout=60)
             except Exception:
                 pass
             if future.done():
-                self._record_future_result(future, func_ea, func_name, callers, callees, export_type, fallback_reason)
+                self._record_future_result(future, func_ea, func_name, export_type, fallback_reason)
         self.pending_futures = [item for item in self.pending_futures if not item[0].done()]
 
-    def _record_future_result(self, future, func_ea, func_name, callers, callees, export_type, fallback_reason):
+    def _record_future_result(self, future, func_ea, func_name, export_type, fallback_reason):
         try:
             success, out_fn, r_callers, r_callees, r_etype, r_freason, error = future.result(timeout=0)
         except Exception as e:
@@ -895,14 +1159,10 @@ class _FuncExportJob(object):
             return
 
         if success:
-            func_info = {
-                'address': func_ea, 'name': func_name, 'filename': out_fn,
-                'export_type': r_etype, 'callers': r_callers, 'callees': r_callees,
-            }
-            if r_freason:
-                func_info['fallback_reason'] = r_freason
-            self.function_index.append(func_info)
-            self.addr_to_info[func_ea] = func_info
+            # 不再把 func_info 攒进内存 list/dict；直接流式写入索引文件。
+            # caller/callee 仅保留地址列表（已由 _write 透传回来），不反向解析名字。
+            self._append_index_line(func_ea, func_name, r_etype, out_fn,
+                                    r_callers or [], r_callees or [], r_freason)
             if r_etype == "disassembly-fallback":
                 self.fallback_funcs.append((func_ea, func_name,
                                             r_freason or "decompilation failed", out_fn))
@@ -920,10 +1180,14 @@ class _FuncExportJob(object):
         """等待 I/O 完成，写日志，显示完成对话框。在主线程中调用，完全安全。"""
         global _active_export_job
 
-        # 等待所有 I/O 完成
+        # 等待所有 I/O 完成（legacy 模式有线程池；consolidated 模式无）
         if self.io_executor is not None:
             self._flush_all_pending(wait=True)
             self.io_executor.shutdown(wait=True)
+            self.io_executor = None
+
+        # 关闭流式文件句柄（索引文件 + 合并输出 decompiled.c）
+        self._close_stream_files()
 
         clear_processing(self.export_dir)
         save_progress(self.export_dir, self.processed_addrs,
@@ -938,6 +1202,7 @@ class _FuncExportJob(object):
         logger.info("  Fallback (disasm) : %d", len(self.fallback_funcs))
         logger.info("  Skipped           : %d", len(self.skipped_funcs))
         logger.info("  Failed            : %d", len(self.failed_funcs))
+        logger.info("  Mode              : %s", self._resolved_mode)
 
         self._write_logs()
         enable_undo()
@@ -965,10 +1230,11 @@ class _FuncExportJob(object):
             elapsed_str = "{:d}m {:02d}s".format(int(elapsed) // 60, int(elapsed) % 60)
 
             summary = ("{}\n\n"
+                       "Mode     : {}\n"
                        "Exported : {}  |  Fallback : {}  |  Failed : {}\n"
                        "Skipped  : {}  |  Time: {}\n\n"
                        "Output: {}").format(
-                title,
+                title, self._resolved_mode,
                 self.exported_funcs, len(self.fallback_funcs),
                 len(self.failed_funcs), len(self.skipped_funcs),
                 elapsed_str, self.export_dir)
@@ -1003,85 +1269,22 @@ class _FuncExportJob(object):
                     f.write("{} | {} | {}\n".format(hex(addr), name, reason))
             logger.info("  Skipped list: decompile_skipped.txt")
 
-        if self.function_index:
-            index_path = os.path.join(ed, "function_index.txt")
-            with open(index_path, 'w', encoding='utf-8') as f:
-                f.write("# Function Index\n")
-                f.write("# Total exported: {}\n".format(len(self.function_index)))
-                f.write("#" + "=" * 80 + "\n\n")
-                for fi in self.function_index:
-                    f.write("=" * 80 + "\n")
-                    f.write("Function: {}\n".format(fi['name']))
-                    f.write("Address: {}\n".format(hex(fi['address'])))
-                    f.write("File: {}\n".format(fi['filename']))
-                    f.write("Type: {}\n".format(fi['export_type']))
-                    if 'fallback_reason' in fi:
-                        f.write("Fallback reason: {}\n".format(fi['fallback_reason']))
-                    f.write("\n")
-                    if fi['callers']:
-                        f.write("Called by ({}):\n".format(len(fi['callers'])))
-                        for ca in fi['callers']:
-                            if ca in self.addr_to_info:
-                                ci = self.addr_to_info[ca]
-                                f.write("  - {} ({}) -> {}\n".format(hex(ca), ci['name'], ci['filename']))
-                            else:
-                                f.write("  - {}\n".format(hex(ca)))
-                    else:
-                        f.write("Called by: none\n")
-                    f.write("\n")
-                    if fi['callees']:
-                        f.write("Calls ({}):\n".format(len(fi['callees'])))
-                        for ce in fi['callees']:
-                            if ce in self.addr_to_info:
-                                ci = self.addr_to_info[ce]
-                                f.write("  - {} ({}) -> {}\n".format(hex(ce), ci['name'], ci['filename']))
-                            else:
-                                f.write("  - {}\n".format(hex(ce)))
-                    else:
-                        f.write("Calls: none\n")
-                    f.write("\n")
-            logger.info("  Function index: function_index.txt")
+        # function_index.txt / function_list.txt 已由流式写入完成（_append_index_line），
+        # 不再在这里做全量内存构建 — 原版的 addr_to_info 反向名字解析是内存+CPU 双重爆炸点。
 
 
-def export_decompiled_functions(export_dir, skip_existing=True, force_reexport=False):
-    """使用 register_timer 驱动的主线程增量导出（不阻塞 IDA UI）。"""
+def export_decompiled_functions(export_dir, skip_existing=True, force_reexport=False, export_mode=None):
+    """使用 register_timer 驱动的主线程增量导出（不阻塞 IDA UI）。
+
+    注意：实际 UI 路径走 _ExportPipeline._tick_decompile；本函数保留为兼容入口。
+    """
     global _active_export_job
-
-    ensure_dir(os.path.join(export_dir, "decompile"))
-    ensure_dir(os.path.join(export_dir, "disassembly"))
-
-    if force_reexport:
-        processed_addrs, prev_fallback, prev_failed, prev_skipped = set(), [], [], []
-        logger.info("Force re-export mode")
-    else:
-        processed_addrs, prev_fallback, prev_failed, prev_skipped = load_progress(export_dir)
-
-    crash_blacklist = load_crash_blacklist(export_dir)
-    all_funcs = list(idautils.Functions())
-    total_funcs = len(all_funcs)
-    remaining_funcs = [ea for ea in all_funcs if ea not in processed_addrs]
-    total_remaining = len(remaining_funcs)
-
-    logger.info("Found %d functions total, %d remaining", total_funcs, total_remaining)
-
-    if total_remaining == 0:
-        logger.info("All functions already exported!")
-        return
-
-    # 不在此处调用 replace_wait_box — pipeline 的等待框可能已由 _tick_decompile 释放
-    # _FuncExportJob.tick() 会在第一个 tick 中通过 show_wait_box 创建自己的等待框
 
     job = _FuncExportJob(
         export_dir=export_dir,
-        remaining_funcs=remaining_funcs,
-        total_funcs=total_funcs,
-        processed_addrs=processed_addrs,
-        crash_blacklist=crash_blacklist,
         skip_existing=skip_existing,
         force_reexport=force_reexport,
-        prev_fallback=prev_fallback,
-        prev_failed=prev_failed,
-        prev_skipped=prev_skipped,
+        export_mode=export_mode,
     )
 
     _active_export_job = job
@@ -1098,33 +1301,42 @@ def export_decompiled_functions(export_dir, skip_existing=True, force_reexport=F
         _active_export_job = None
 
 
-def export_decompiled_functions_sync(export_dir, skip_existing=True, force_reexport=False):
+def export_decompiled_functions_sync(export_dir, skip_existing=True, force_reexport=False, export_mode=None):
     """阻塞式导出函数，用于批处理模式。"""
-    ensure_dir(os.path.join(export_dir, "decompile"))
-    ensure_dir(os.path.join(export_dir, "disassembly"))
-
     job = _FuncExportJob(
         export_dir=export_dir,
         skip_existing=skip_existing,
         force_reexport=force_reexport,
+        export_mode=export_mode,
     )
     job.run_blocking(show_dialog=False)
 
 
-def export_strings(export_dir):
-    """导出所有字符串"""
+def export_strings(export_dir, min_len=0):
+    """导出所有字符串。min_len>0 时按最小长度过滤短串（consolidated 模式省 token）。"""
     strings_path = os.path.join(export_dir, "strings.txt")
 
     string_count = 0
+    skipped_count = 0
     BATCH_SIZE = 500  # 每500个字符串清理一次
 
     with open(strings_path, 'w', encoding='utf-8') as f:
         f.write("# Strings exported from IDA\n")
         f.write("# Format: address | length | type | string\n")
+        if min_len > 0:
+            f.write("# (min_len filter={} applied)\n".format(min_len))
         f.write("#" + "=" * 80 + "\n\n")
 
         for idx, s in enumerate(idautils.Strings()):
             try:
+                # 长度过滤（consolidated 模式省 token）
+                try:
+                    slen = int(s.length)
+                except Exception:
+                    slen = 0
+                if min_len > 0 and slen < min_len:
+                    skipped_count += 1
+                    continue
                 string_content = str(s)
                 str_type = "ASCII"
                 if s.strtype == ida_nalt.STRTYPE_C_16:
@@ -1134,7 +1346,7 @@ def export_strings(export_dir):
 
                 f.write("{} | {} | {} | {}\n".format(
                     hex(s.ea),
-                    s.length,
+                    slen,
                     str_type,
                     string_content.replace('\n', '\\n').replace('\r', '\\r')
                 ))
@@ -1148,7 +1360,8 @@ def export_strings(export_dir):
                 continue
 
     logger.info("Strings Summary:")
-    logger.info("  Total strings exported: %d", string_count)
+    logger.info("  Total strings exported: %d (skipped %d by min_len=%d)",
+                string_count, skipped_count, min_len)
 
 
 def export_imports(export_dir):
@@ -1600,6 +1813,159 @@ def export_pointers(export_dir):
 
 
 # ============================================================================
+# Callgraph sampling (consolidated/large-binary mode)
+# ============================================================================
+
+def _entry_point_addrs():
+    """收集 entry/导出函数地址，作为调用图采样的起点。"""
+    starts = set()
+    try:
+        qty = ida_entry.get_entry_qty()
+        for i in range(qty):
+            ordinal = ida_entry.get_entry_ordinal(i)
+            ea = ida_entry.get_entry(ordinal)
+            if ea != ida_idaapi.BADADDR:
+                starts.add(ea)
+    except Exception:
+        pass
+    return starts
+
+
+def export_callgraph(export_dir, max_hops=LARGE_CALLGRAPH_BFS_HOPS, max_nodes=LARGE_CALLGRAPH_MAX_NODES):
+    """从 entry/export 函数出发做 N 跳 BFS，采样「关注子图」写入 callgraph.txt。
+
+    全量 caller/callee 在大文件下是 O(F·degree) 的 CPU 杀手；这里只对入口可达函数
+    建图，给 AI 一个可导航的骨架，而不是全量边表。常数内存（已写盘即丢弃）。
+    """
+    output_path = os.path.join(export_dir, "callgraph.txt")
+    roots = _entry_point_addrs()
+    if not roots:
+        logger.info("No entry points found, skipping callgraph")
+        return
+
+    visited = set()
+    frontier = set()
+    for r in roots:
+        if ida_funcs.get_func(r) is not None:
+            frontier.add(r)
+
+    edges = []  # (caller_ea, callee_ea)
+    hop = 0
+    while hop < max_hops and frontier and len(visited) < max_nodes:
+        next_frontier = set()
+        for ea in frontier:
+            if ea in visited or len(visited) >= max_nodes:
+                continue
+            visited.add(ea)
+            for callee in get_callees(ea):
+                edges.append((ea, callee))
+                if callee not in visited:
+                    next_frontier.add(callee)
+        frontier = next_frontier
+        hop += 1
+
+    # 把还在 frontier 里但未访问的根/可达点也记进 visited（受 max_nodes 限制）
+    for ea in list(frontier):
+        if len(visited) >= max_nodes:
+            break
+        visited.add(ea)
+
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("# Callgraph (sampled from entry/export functions)\n")
+            f.write("# Roots: {} | Hops: {} | Nodes: {} | Edges: {}\n".format(
+                len(roots), max_hops, len(visited), len(edges)))
+            f.write("# Format: caller_addr | caller_name -> callee_addr | callee_name\n")
+            f.write("#" + "=" * 80 + "\n\n")
+            for caller, callee in edges:
+                cname = ida_funcs.get_func_name(caller) or hex(caller)
+                cename = ida_funcs.get_func_name(callee) or hex(callee)
+                f.write("{:X} | {} -> {:X} | {}\n".format(caller, cname, callee, cename))
+        logger.info("Callgraph exported: %d nodes, %d edges", len(visited), len(edges))
+    except Exception as e:
+        logger.error("Failed to write callgraph: %s", str(e))
+
+
+# ============================================================================
+# AGENTS.md generator (AI auto-start context)
+# ============================================================================
+
+def write_agents_md(export_dir, resolved_mode, total_funcs=0, skipped_memory=False,
+                    skipped_strings_filter=False):
+    """在导出目录写 AGENTS.md，让 AI 自动理解导出布局，无需每次重新学习。
+
+    受 Cursor / Claude Code / Codex 等识别。文件本身约 1-2KB token。
+    """
+    path = os.path.join(export_dir, "AGENTS.md")
+    consolidated = (resolved_mode == EXPORT_MODE_CONSOLIDATED)
+
+    func_table = (
+        "| `decompiled.c` | 合并反编译/反汇编回退代码，每个函数含元数据头 | consolidated 模式（大文件） |\n"
+        "| `decompile/` | 每个成功反编译函数一个 `.c` | legacy 模式（小文件） |\n"
+        "| `disassembly/` | 反编译失败回退，每个函数一个 `.asm` | legacy 模式 |"
+        if True else ""
+    )
+
+    content = []
+    content.append("# IDA Export for AI Analysis\n")
+    content.append("> 本目录由 INP.py（IDA Export for AI）导出。下面是 AI 直接开始分析的导航指南。\n")
+    content.append("## 导出模式\n")
+    content.append("- **resolved mode**: `{}`（auto 会按函数数自动在 legacy/consolidated 间选择）\n".format(resolved_mode))
+    content.append("- **total functions**: {}\n".format(total_funcs))
+    content.append("- legacy = 每函数单文件；consolidated = 合并单文件（大文件避免 token 爆炸）\n")
+    content.append("\n## 目录布局\n")
+    content.append("| 路径 | 内容 | 说明 |\n")
+    content.append("| ---- | ---- | ---- |\n")
+    content.append("| `decompiled.c` | 合并反编译 + 回退代码，每函数含元数据头 | consolidated 模式 |\n")
+    content.append("| `decompile/` | 每个成功反编译函数一个 `.c` | legacy 模式 |\n")
+    content.append("| `disassembly/` | 反编译失败回退，每函数一个 `.asm` | legacy 模式 |\n")
+    content.append("| `function_index.txt` | 函数索引（含 callers/callees 地址） | legacy 模式 |\n")
+    content.append("| `function_list.txt` | 函数列表（精简单行） | consolidated 模式 |\n")
+    content.append("| `callgraph.txt` | 从 entry/export 采样的调用图 | consolidated 模式 |\n")
+    content.append("| `strings.txt` | 字符串表：地址 | 长度 | 类型 | 内容 | 始终 |\n")
+    content.append("| `imports.txt` | 导入表：地址:函数名 | 始终 |\n")
+    content.append("| `exports.txt` | 导出表：地址:函数名 | 始终 |\n")
+    content.append("| `pointers.txt` | 指针引用：源 | 段 | 目标 | 类型 | 详情 | 始终 |\n")
+    content.append("| `memory/` | 内存 hexdump（1MB 分片） | 仅 legacy 且未跳过 |\n")
+    content.append("| `disassembly_fallback.txt` | 回退到反汇编的函数列表 | 有回退时 |\n")
+    content.append("| `decompile_failed.txt` | 彻底失败的函数列表 | 有失败时 |\n")
+    content.append("\n## 元数据头字段（每个函数 `.c`/`.asm` 头部，或 `decompiled.c` 内）\n")
+    content.append("```c\n")
+    content.append("/*\n")
+    content.append(" * func-name: sub_401000       // 函数名\n")
+    content.append(" * func-address: 0x401000      // 起始地址\n")
+    content.append(" * export-type: decompile      // decompile | disassembly-fallback\n")
+    content.append(" * callers: 0x402000, 0x403000 // 调用者地址（consolidated 大文件可能为空，见 callgraph.txt）\n")
+    content.append(" * callees: 0x404000           // 被调用者地址\n")
+    content.append(" * fallback-reason: ...        // 仅回退时出现\n")
+    content.append(" */\n")
+    content.append("```\n")
+    content.append("\n## 建议分析工作流\n")
+    content.append("1. **先读** `imports.txt` / `exports.txt` / `strings.txt` 建立全局观\n")
+    content.append("2. **找入口**：`exports.txt`/`callgraph.txt`（consolidated）或 `function_index.txt` 中 callers 为空或为入口的函数\n")
+    content.append("3. **按地址跳转**：拿到目标函数 `0x401000` 后，在 `decompiled.c` 搜索 `func-address: 0x401000`，或在 `decompile/401000.c` 直接打开\n")
+    content.append("4. **追调用链**：用 `callers`/`callees` 地址或 `callgraph.txt` 顺藤摸瓜\n")
+    content.append("5. **大文件**：优先用 `function_list.txt` + `callgraph.txt` 做索引，不要一次性把 `decompiled.c` 整个喂给 AI\n")
+    content.append("\n## 备注\n")
+    if consolidated:
+        content.append("- 本目录是 **consolidated 模式**（{} 函数）：每函数文件已合并，raw memory 已跳过以省 token。\n".format(total_funcs))
+        content.append("- caller/callee 单函数粒度的图未生成，请用 `callgraph.txt` 做调用关系导航。\n")
+    else:
+        content.append("- 本目录是 **legacy 模式**：每个函数独立文件，`function_index.txt` 含完整 callers/callees 地址。\n")
+    if skipped_memory:
+        content.append("- `memory/` 已跳过（raw hex 对 AI 分析价值低且最占 token）。\n")
+    content.append("\n---\n")
+    content.append("Generated by INP.py (IDA Export for AI)\n")
+
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.writelines(content)
+        logger.info("AGENTS.md written (AI auto-start context)")
+    except Exception as e:
+        logger.error("Failed to write AGENTS.md: %s", str(e))
+
+
+# ============================================================================
 # Timer-Driven Export Pipeline (non-blocking, macOS safe)
 # ============================================================================
 
@@ -1624,10 +1990,13 @@ class _ExportPipeline(object):
     PTR_HEADS_PER_TICK = 1500  # 每 tick 最多扫描的 head 数量
     ANALYSIS_POLL_INTERVAL_MS = 100  # auto-analysis 轮询间隔（ms）
 
-    def __init__(self, export_dir, force_reexport, skip_auto_analysis):
+    def __init__(self, export_dir, force_reexport, skip_auto_analysis, export_mode=None):
         self.export_dir = export_dir
         self.force_reexport = force_reexport
         self.skip_auto_analysis = skip_auto_analysis
+        self.export_mode = export_mode or EXPORT_MODE_AUTO
+        self._resolved_mode = None  # 在 _tick_init 看到函数数后定稿
+        self._total_funcs = 0
         self.has_hexrays = None  # 在 _tick_init 中确定
 
         self._timer = None
@@ -1637,7 +2006,8 @@ class _ExportPipeline(object):
         self._phase = 0
         self._phase_initialized = False
 
-        # 动态构建阶段列表
+        # 动态构建阶段列表（Memory 仅 legacy 模式；consolidated 大文件跳过 raw hex）
+        # 注意：Memory/Callgraph 的最终去留取决于 _resolved_mode，在 _tick_init 里调整。
         self._phase_names = []
         if not skip_auto_analysis:
             self._phase_names.append("Analysis")
@@ -1711,23 +2081,23 @@ class _ExportPipeline(object):
         if not self._job_owns_wait_box():
             self._update_wait_box()
 
-        # 动态构建 handlers 列表
-        handlers = []
-        if not self.skip_auto_analysis:
-            handlers.append(self._tick_analysis)
-        handlers.append(self._tick_init)
-        handlers.extend([
-            self._tick_strings,
-            self._tick_imports,
-            self._tick_exports,
-            self._tick_pointers,
-            self._tick_memory,
-        ])
-        if self.has_hexrays:
-            handlers.append(self._tick_decompile)
+        # 按阶段名查 handler，保证 handlers 顺序与 _phase_names（含动态增删）严格一致
+        handler_by_name = {
+            "Analysis": self._tick_analysis,
+            "Init": self._tick_init,
+            "Strings": self._tick_strings,
+            "Imports": self._tick_imports,
+            "Exports": self._tick_exports,
+            "Pointers": self._tick_pointers,
+            "Memory": self._tick_memory,
+            "Callgraph": self._tick_callgraph,
+            "Decompile": self._tick_decompile,
+        }
 
         try:
-            done = handlers[self._phase]()
+            phase_name = self._phase_names[self._phase]
+            handler = handler_by_name[phase_name]
+            done = handler()
         except Exception as e:
             logger.error("Pipeline phase %s error: %s", self._phase_names[self._phase], e, exc_info=True)
             done = True
@@ -1772,14 +2142,39 @@ class _ExportPipeline(object):
     # ------------------------------------------------------------------
 
     def _tick_init(self):
-        """初始化 Hex-Rays 反编译器并动态追加 Decompile 阶段。"""
+        """初始化 Hex-Rays 反编译器，定稿导出模式，并据此调整阶段列表。"""
+        # 1) 根据函数数量最终定稿导出模式
+        try:
+            self._total_funcs = sum(1 for _ in idautils.Functions())
+        except Exception:
+            self._total_funcs = 0
+        self._resolved_mode = _resolve_export_mode(self.export_mode, self._total_funcs)
+        logger.info("Export mode: %s → resolved=%s (%d funcs)",
+                    self.export_mode, self._resolved_mode, self._total_funcs)
+
+        # 2) consolidated 模式：跳过 Memory（raw hex 对 AI 价值低且最占 token），插入 Callgraph
+        if self._resolved_mode == EXPORT_MODE_CONSOLIDATED:
+            if "Memory" in self._phase_names:
+                self._phase_names.remove("Memory")
+            # Callgraph 插在 Decompile 之前
+            if "Callgraph" not in self._phase_names:
+                # 找到 Decompile 位置（若已追加）；否则追加到末尾（Decompile 稍后动态加）
+                try:
+                    idx = self._phase_names.index("Decompile")
+                except ValueError:
+                    idx = len(self._phase_names)
+                self._phase_names.insert(idx, "Callgraph")
+        self._total_phases = len(self._phase_names)
+
+        # 3) 初始化 Hex-Rays 反编译器
         if ida_hexrays is None:
             self.has_hexrays = False
             logger.warning("ida_hexrays module not available, skipping decompilation")
             return True
         if ida_hexrays.init_hexrays_plugin():
             self.has_hexrays = True
-            self._phase_names.append("Decompile")
+            if "Decompile" not in self._phase_names:
+                self._phase_names.append("Decompile")
             self._total_phases = len(self._phase_names)
             logger.info("Hex-Rays decompiler initialized")
         else:
@@ -1834,6 +2229,8 @@ class _ExportPipeline(object):
             self._phase_initialized = True
 
         batch = 0
+        # consolidated 模式按最小长度过滤短字符串（噪声大、占 token）
+        min_len = LARGE_STRING_MIN_LEN if self._resolved_mode == EXPORT_MODE_CONSOLIDATED else 0
         while batch < self.STRINGS_BATCH:
             if self._should_yield():
                 break
@@ -1845,6 +2242,14 @@ class _ExportPipeline(object):
                 logger.info("Exported %d strings", self._str_count)
                 return True
             try:
+                # 长度过滤（consolidated 模式省 token）
+                try:
+                    slen = int(s.length)
+                except Exception:
+                    slen = 0
+                if min_len and slen < min_len:
+                    batch += 1
+                    continue
                 string_content = str(s)
                 str_type = "ASCII"
                 if s.strtype == ida_nalt.STRTYPE_C_16:
@@ -1852,7 +2257,7 @@ class _ExportPipeline(object):
                 elif s.strtype == ida_nalt.STRTYPE_C_32:
                     str_type = "UTF-32"
                 self._str_f.write("{} | {} | {} | {}\n".format(
-                    hex(s.ea), s.length, str_type,
+                    hex(s.ea), slen, str_type,
                     string_content.replace('\n', '\\n').replace('\r', '\\r')))
                 self._str_count += 1
             except Exception:
@@ -2118,6 +2523,15 @@ class _ExportPipeline(object):
         return False
 
     # ------------------------------------------------------------------
+    # Stage: Callgraph (consolidated 模式：从 entry/export 采样调用图)
+    # ------------------------------------------------------------------
+
+    def _tick_callgraph(self):
+        """采样调用图，写 callgraph.txt。单 tick 完成（BFS 跳数/节点数有上限）。"""
+        export_callgraph(self.export_dir)
+        return True
+
+    # ------------------------------------------------------------------
     # Stage: Decompile (通过 pipeline timer 直接驱动，不嵌套 register_timer)
     # ------------------------------------------------------------------
 
@@ -2132,11 +2546,14 @@ class _ExportPipeline(object):
         global _active_export_job
 
         if not self._phase_initialized:
-            # 第一次调用：创建 job，不注册新定时器
+            # 第一次调用：创建 job，不注册新定时器；把 resolved_mode 传下去
+            # （auto 在 _tick_init 已定稿，直接用 resolved 值，避免 job 再次猜测）
+            job_mode = self._resolved_mode or self.export_mode
             self._job = _FuncExportJob(
                 export_dir=self.export_dir,
                 skip_existing=True,
                 force_reexport=self.force_reexport,
+                export_mode=job_mode,
             )
             self._job._start_time = self._start_time
             # 继承 pipeline 已显示的 wait box，避免 job 再次 show_wait_box 重建对话框
@@ -2182,6 +2599,15 @@ class _ExportPipeline(object):
                     break
             self._wait_box_active = False
 
+        # 始终写 AGENTS.md（AI 自动开始分析的导航上下文）
+        resolved = self._resolved_mode or EXPORT_MODE_LEGACY
+        skipped_memory = (resolved == EXPORT_MODE_CONSOLIDATED)  # consolidated 跳过 memory
+        try:
+            write_agents_md(self.export_dir, resolved, self._total_funcs,
+                            skipped_memory=skipped_memory)
+        except Exception as e:
+            logger.error("AGENTS.md generation failed: %s", e)
+
         _active_pipeline = None
 
         if cancelled:
@@ -2190,16 +2616,19 @@ class _ExportPipeline(object):
                         self._phase + 1, self._total_phases)
             ida_kernwin.info("Export cancelled by user.")
         elif self.has_hexrays is not True:
-            # 无 Hex-Rays 或初始化前退出时，pipeline 是最终完成者
+            # 无 Hex-Rays 或初始化前退出时，pipeline 是最终完成者，需显示完成对话框
             enable_undo()
             elapsed = time.time() - self._start_time
             elapsed_str = "{:d}m {:02d}s".format(int(elapsed) // 60, int(elapsed) % 60)
             logger.info("Export completed (no Hex-Rays)")
             ida_kernwin.info("Export completed (no decompiler)!\n\nTime: {}\nOutput: {}".format(
                 elapsed_str, self.export_dir))
+        # 注：有 Hex-Rays 且 Decompile 阶段正常完成时，完成对话框已由 job._finish() 显示，
+        #     pipeline 这里不再重复弹窗（避免双重对话框）。
 
 
-def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_count=None, force_reexport=False):
+def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_count=None,
+              force_reexport=False, export_mode=None):
     """执行导出操作
 
     所有耗时操作（auto-analysis 等待、Hex-Rays 初始化、数据导出）都在定时器驱动的
@@ -2211,6 +2640,7 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
         skip_auto_analysis: 是否跳过等待自动分析（如果已经分析完成）
         worker_count: 并行工作线程数，默认为CPU核心数-1
         force_reexport: 强制重新导出所有函数（忽略之前的进度，用于patch后重新导出）
+        export_mode: 导出模式 auto|legacy|consolidated（None → EXPORT_MODE_DEFAULT）
     """
     global WORKER_COUNT
 
@@ -2218,10 +2648,13 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
     if worker_count is not None:
         WORKER_COUNT = max(1, worker_count)
 
+    if export_mode is None:
+        export_mode = EXPORT_MODE_DEFAULT
+
     logger.info("=" * 60)
     logger.info("IDA Export for AI Analysis")
     logger.info("=" * 60)
-    logger.info("Using %d worker threads for parallel I/O", WORKER_COUNT)
+    logger.info("Using %d worker threads for parallel I/O | mode=%s", WORKER_COUNT, export_mode)
 
     # 初始清理
     clear_undo_buffer()
@@ -2273,6 +2706,7 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
         export_dir=export_dir,
         force_reexport=force_reexport,
         skip_auto_analysis=skip_auto_analysis,
+        export_mode=export_mode,
     )
     if not pipeline.start():
         enable_undo()
@@ -2280,17 +2714,20 @@ def do_export(export_dir=None, ask_user=True, skip_auto_analysis=False, worker_c
         return
 
 
-def do_export_sync(export_dir=None, skip_auto_analysis=False, worker_count=None, force_reexport=False):
+def do_export_sync(export_dir=None, skip_auto_analysis=False, worker_count=None,
+                   force_reexport=False, export_mode=None):
     """同步阻塞导出，适用于 `idat -A -S...` 批处理模式。"""
     global WORKER_COUNT
 
     if worker_count is not None:
         WORKER_COUNT = max(1, worker_count)
+    if export_mode is None:
+        export_mode = EXPORT_MODE_DEFAULT
 
     logger.info("=" * 60)
     logger.info("IDA Export for AI Analysis (blocking batch mode)")
     logger.info("=" * 60)
-    logger.info("Using %d worker threads for parallel I/O", WORKER_COUNT)
+    logger.info("Using %d worker threads for parallel I/O | mode=%s", WORKER_COUNT, export_mode)
 
     clear_undo_buffer()
     disable_undo()
@@ -2318,12 +2755,37 @@ def do_export_sync(export_dir=None, skip_auto_analysis=False, worker_count=None,
             except Exception as e:
                 logger.warning("Failed to initialize Hex-Rays: %s", str(e))
 
-        export_strings(export_dir)
+        # 定稿导出模式（auto → legacy/consolidated）
+        try:
+            total_funcs = sum(1 for _ in idautils.Functions())
+        except Exception:
+            total_funcs = 0
+        resolved_mode = _resolve_export_mode(export_mode, total_funcs)
+        logger.info("Resolved export mode: %s (%d funcs)", resolved_mode, total_funcs)
+
+        # 字符串：consolidated 模式按最小长度过滤短串
+        export_strings(export_dir, min_len=(LARGE_STRING_MIN_LEN if resolved_mode == EXPORT_MODE_CONSOLIDATED else 0))
+
         export_imports(export_dir)
         export_exports(export_dir)
         export_pointers(export_dir)
-        export_memory(export_dir)
-        export_decompiled_functions_sync(export_dir, skip_existing=True, force_reexport=force_reexport)
+
+        # consolidated 模式：跳过 raw memory（对 AI 价值低、最占 token），并生成采样调用图
+        if resolved_mode != EXPORT_MODE_CONSOLIDATED:
+            export_memory(export_dir)
+
+        if resolved_mode == EXPORT_MODE_CONSOLIDATED:
+            export_callgraph(export_dir)
+
+        export_decompiled_functions_sync(export_dir, skip_existing=True,
+                                         force_reexport=force_reexport, export_mode=resolved_mode)
+
+        # 写 AGENTS.md（AI 自动开始分析）
+        try:
+            write_agents_md(export_dir, resolved_mode, total_funcs,
+                            skipped_memory=(resolved_mode == EXPORT_MODE_CONSOLIDATED))
+        except Exception as e:
+            logger.error("AGENTS.md generation failed: %s", e)
 
         logger.info("Blocking export completed: %s", export_dir)
     finally:
@@ -2363,6 +2825,7 @@ class ExportForAIPlugmod(ida_idaapi.plugmod_t):
             choice = ida_kernwin.ask_yn(ida_kernwin.ASKBTN_YES,
                                         "Export for AI Analysis\n\n"
                                         "Directory: {}\n\n"
+                                        "Mode: auto (小文件=每函数单文件, 大文件=合并)\n\n"
                                         "Yes: Export (skip already exported)\n"
                                         "No: Force re-export all (use after patching)\n"
                                         "Cancel: Abort".format(default_dir))
@@ -2373,7 +2836,9 @@ class ExportForAIPlugmod(ida_idaapi.plugmod_t):
 
             force_reexport = (choice == ida_kernwin.ASKBTN_NO)
 
-            do_export(export_dir=default_dir, ask_user=False, force_reexport=force_reexport)
+            # UI 入口固定 auto 模式；批处理模式（idat -S）可通过第4个 ARGV 指定
+            do_export(export_dir=default_dir, ask_user=False,
+                      force_reexport=force_reexport, export_mode=EXPORT_MODE_AUTO)
         except Exception as e:
             logger.error("Export failed: %s", e, exc_info=True)
             ida_kernwin.warning("Export failed!\n\n{}".format(str(e)))
@@ -2410,20 +2875,25 @@ def PLUGIN_ENTRY():
 if __name__ == "__main__":
     # 支持作为独立脚本运行（用于批处理模式）
     # ARGV 是 IDC 概念，批处理模式下通过 idc 模块获取
+    #   ARGV[1] = export_dir   (可选)
+    #   ARGV[2] = skip_analysis ("1" 跳过 auto-analysis)
+    #   ARGV[3] = export_mode   ("auto" | "legacy" | "consolidated"，默认 auto)
     import idc as _idc
     argc = int(_idc.eval_idc("ARGV.count"))
-    if argc < 2:
-        export_dir = None
-        skip_analysis = False
-    elif argc < 3:
+    export_dir = None
+    skip_analysis = False
+    export_mode = EXPORT_MODE_AUTO
+    if argc >= 2:
         export_dir = _idc.eval_idc("ARGV[1]")
-        skip_analysis = False
-    else:
-        export_dir = _idc.eval_idc("ARGV[1]")
+    if argc >= 3:
         skip_analysis = (_idc.eval_idc("ARGV[2]") == "1")
+    if argc >= 4:
+        m = _idc.eval_idc("ARGV[3]")
+        if m in EXPORT_MODES:
+            export_mode = m
 
     # 批处理模式改用同步导出，确保所有文件写完后再退出
-    do_export_sync(export_dir, skip_auto_analysis=skip_analysis)
+    do_export_sync(export_dir, skip_auto_analysis=skip_analysis, export_mode=export_mode)
 
     # 只在批处理模式下退出
     if argc >= 2:
